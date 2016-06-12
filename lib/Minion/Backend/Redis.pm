@@ -1,6 +1,7 @@
 package Minion::Backend::Redis;
 use Mojo::Base 'Minion::Backend';
 
+use Mojo::IOLoop;
 use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Redis2;
 use Sys::Hostname 'hostname';
@@ -8,6 +9,7 @@ use Time::HiRes 'time';
 
 our $VERSION = '0.1';
 
+has ioloop => sub { Mojo::IOLoop->new() };
 has name => 'ns';
 has 'redis';
 
@@ -21,7 +23,6 @@ sub dequeue {
 
   my $redis = $self->redis;
   my $queues = $options->{queues} //= ['default'];
-  $wait ||= 1;
 
   # check deps
   $self->_resolve_deps($_, 'parents', 1)
@@ -33,22 +34,21 @@ sub dequeue {
     for @{$redis->zrangebyscore($dkey, 0, time)};
 
   # wait for items from queue
-  my $job_id
-    = $redis->brpop((map $self->_q($_), @$queues), int($wait + 0.5))->[1];
-  return unless $job_id && $redis->exists(my $key = $self->_j($job_id));
+  if (my $job = $self->_try($id, $options)) { return $job }
+  my $ioloop = $self->ioloop;
+  return undef if $ioloop->is_running;
 
-  $redis->sadd($self->_w($id => 'jobs'), $job_id);
+  my $resp;
+  $redis->brpop(
+    (map $self->_q($_), @$queues),
+    int(($wait || 1) + 0.5),
+    sub { $resp = $_[2]; $ioloop->stop; }
+  );
+  my $timer = $ioloop->timer($wait => sub { $ioloop->stop });
+  $ioloop->start;
+  $ioloop->remove($timer);
 
-  # update job
-  $redis->hmset($key, started => time, state => 'active', worker => $id);
-
-  # and fetch info
-  my $job;
-  @{$job}{qw(id args retries task)}
-    = @{$redis->hmget($key, qw(id args retries task))};
-  $job->{args} = decode_json $job->{args};
-
-  return $job;
+  return $self->_try($id, $options, $resp);
 }
 
 sub enqueue {
@@ -136,7 +136,7 @@ sub list_jobs {
       and (!$options->{task}  || ($options->{task} eq $_->{task}))
   } map $self->job_info($_), @ids;
 
-  return [splice @list, ($offset // 0), ($limit // ~0>>1)];
+  return [splice @list, ($offset // 0), ($limit // ~0 >> 1)];
 }
 
 sub list_workers {
@@ -144,7 +144,7 @@ sub list_workers {
 
   my @ids
     = sort { $b <=> $a } @{$self->redis->smembers($self->_key('workers'))};
-  @ids = splice @ids, ($offset // 0), ($limit // ~0>>1);
+  @ids = splice @ids, ($offset // 0), ($limit // ~0 >> 1);
   return [map $self->worker_info($_), @ids];
 }
 
@@ -392,6 +392,33 @@ sub _resolve_deps {
   return $resolved;
 }
 
+sub _try {
+  my ($self, $id, $options, $resp) = @_;
+
+  my $redis = $self->redis;
+
+  my $job_id;
+  if ($resp) { $job_id = $resp->[1] }
+  else {
+    ($job_id = $redis->rpop($self->_q($_))) and last for @{$options->{queues}};
+  }
+
+  return undef unless $job_id && $redis->exists(my $key = $self->_j($job_id));
+
+  $redis->sadd($self->_w($id => 'jobs'), $job_id);
+
+  # update job
+  $redis->hmset($key, started => time, state => 'active', worker => $id);
+
+  # and fetch info
+  my $job;
+  @{$job}{qw(id args retries task)}
+    = @{$redis->hmget($key, qw(id args retries task))};
+  $job->{args} = decode_json $job->{args};
+
+  return $job;
+}
+
 sub _update {
   my ($self, $fail, $id, $retries, $result) = @_;
   my $redis = $self->redis;
@@ -444,6 +471,13 @@ L<Minion::Backend::Redis> is a backend for L<Minion> based on L<Mojo::Redis>.
 
 L<Minion::Backend::Redis> inherits all attributes from L<Minion::Backend> and
 implements the following new ones.
+
+=head2 ioloop
+
+  my $ioloop = $backend->ioloop;
+  $backend   = $backend->ioloop(Mojo::IOLoop->new);
+
+L<Mojo::IOLoop> object used for non-blocking operations.
 
 =head2 name
 
