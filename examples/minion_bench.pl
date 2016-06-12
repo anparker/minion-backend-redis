@@ -7,8 +7,8 @@ my $ENQUEUE     = 10000;
 my $DEQUEUE     = 1000;
 my $REPETITIONS = 2;
 my $WORKERS     = 4;
-my $STATS       = 20;
-my $REPAIR      = 20;
+my $STATS       = 10;
+my $REPAIR      = 10;
 
 # A benchmark script for comparing backends and evaluating the performance
 # impact of proposed changes
