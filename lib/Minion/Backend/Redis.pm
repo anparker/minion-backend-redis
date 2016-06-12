@@ -936,7 +936,7 @@ Epoch time worker was started.
 
 =back
 
-=head1 CREDIST
+=head1 CREDITS
 
 Most of documentation was copied from L<Minion::Backend::Pg>.
 
