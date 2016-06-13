@@ -136,7 +136,7 @@ sub list_jobs {
       and (!$options->{task}  || ($options->{task} eq $_->{task}))
   } map $self->job_info($_), @ids;
 
-  return [splice @list, ($offset // 0), ($limit // ~0>>1)];
+  return [splice @list, ($offset // 0), ($limit // ~0 >> 1)];
 }
 
 sub list_workers {
@@ -144,7 +144,7 @@ sub list_workers {
 
   my @ids
     = sort { $b <=> $a } @{$self->redis->smembers($self->_key('workers'))};
-  @ids = splice @ids, ($offset // 0), ($limit // ~0>>1);
+  @ids = splice @ids, ($offset // 0), ($limit // ~0 >> 1);
   return [map $self->worker_info($_), @ids];
 }
 
@@ -205,25 +205,29 @@ sub repair {
       if $notified < $missing_after;
   }
 
-  my @queues = @{$redis->smembers($self->_key('queues'))};
+  my $queues = $redis->smembers($self->_key('queues'));
 
-  for my $q (@queues) {
-    my @jobs
-      = map { $redis->hmget($self->_j($_), qw(id retries state finished worker)) }
-      @{$redis->smembers($self->_q($q => 'jobs'))};
+  for my $q (@$queues) {
 
-    # Jobs with missing worker (can be retried)
-    $self->fail_job(@{$_}[0, 1], 'Worker went away')
-      for grep { ($_->[2] eq 'active') && (!$workers{$_->[4]}) } @jobs;
+    my $key = $self->_q($q => 'jobs');
+  NEXT_JOB:
+    for (@{$redis->scan->smembers($key)}) {
+      my ($id, $retries, $state, $finished, $worker)
+        = @{$redis->hmget($self->_j($_), qw(id retries state finished worker))};
 
-    for (@jobs) {
-      my ($id, $retries, $state, $finished) = @$_;
+      # Jobs without definition (can't do anything about them)
+      $redis->srem($key, $_) and next unless $id;
+
+      # Jobs with missing worker (can be retried)
+      if ($state eq 'active' && !$workers{$worker}) {
+        $self->fail_job($id, $retries, 'Worker went away');
+        next;
+      }
 
       # Jobs with missing parents (can't be retried)
       if ($state eq 'inactive') {
-        my $failed = 0;
         !$redis->exists($self->_j($_))
-          and do { $self->_fail_job($id, 'Parent went away'); last; }
+          and do { $self->_fail_job($id, 'Parent went away'); next NEXT_JOB; }
           for @{$redis->smembers($self->_j($id => 'parents'))};
       }
 
